@@ -1,0 +1,194 @@
+name: QUANT NOVA G9B image
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'QUANT_NOVA_3.1.2_MASTER_GROUNDUP_9B.zip'
+      - '.github/workflows/nova-groundup9b-image.yml'
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  SOURCE_ZIP: QUANT_NOVA_3.1.2_MASTER_GROUNDUP_9B.zip
+  SOURCE_ZIP_SHA256: 24f8523ac5eecd733b86b5c48368c499ba4064e364dda4aad03371d69863e878
+  IMAGE: ghcr.io/bbblaprk-svg/kiwoom-smartmoney-daytrader:nova-3.1.2-master-groundup-9b
+
+jobs:
+  build-test-publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify immutable source ZIP
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test -f "$SOURCE_ZIP"
+          actual="$(sha256sum "$SOURCE_ZIP" | awk '{print $1}')"
+          echo "EXPECTED=$SOURCE_ZIP_SHA256"
+          echo "ACTUAL=$actual"
+          test "$actual" = "$SOURCE_ZIP_SHA256"
+          unzip -t "$SOURCE_ZIP"
+          rm -rf .g9b-build
+          mkdir .g9b-build
+          unzip -q "$SOURCE_ZIP" -d .g9b-build
+          test -f .g9b-build/nova3120/Dockerfile
+          (cd .g9b-build/nova3120 && sha256sum -c SOURCE_MANIFEST.sha256)
+          node --check .g9b-build/nova3120/static/nova.js
+          grep -q 'if clean=="/api/auth/check"' .g9b-build/nova3120/ops/http_guard_v2.py
+          grep -q 'def websocket_proxy(self):' .g9b-build/nova3120/ops/http_guard_v2.py
+          ! grep -q 'cached=cget(self.path)' .g9b-build/nova3120/ops/http_guard_v2.py
+          grep -q "h\['X-App-Token'\]=token" .g9b-build/nova3120/static/nova.js
+          grep -q "h\['Authorization'\]='Bearer '+token" .g9b-build/nova3120/static/nova.js
+          grep -q '"X-App-Token"' .g9b-build/nova3120/ops/http_guard_v2.py
+          grep -q "localStorage.removeItem('nova_token')" .g9b-build/nova3120/static/nova.js
+
+      - name: Build immutable image (tests execute inside Dockerfile)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          created="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          shortsha="${GITHUB_SHA:0:12}"
+          docker build --pull --no-cache \
+            --build-arg BUILD_GIT_SHA="$GITHUB_SHA" \
+            --build-arg SOURCE_ZIP_SHA="$SOURCE_ZIP_SHA256" \
+            --build-arg BUILD_CREATED_AT="$created" \
+            -t "$IMAGE" \
+            -t "ghcr.io/bbblaprk-svg/kiwoom-smartmoney-daytrader:sha-$shortsha" \
+            .g9b-build/nova3120
+
+      - name: Verify image identity and full synthetic validation
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test "$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.version"}}' "$IMAGE")" = "NOVA-3.1.2-MASTER-GROUNDUP-9B"
+          test "$(docker image inspect -f '{{index .Config.Labels "io.quantnova.source_zip_sha256"}}' "$IMAGE")" = "$SOURCE_ZIP_SHA256"
+          test "$(docker image inspect -f '{{index .Config.Labels "io.quantnova.deploy_model"}}' "$IMAGE")" = "GHCR_PULL_ONLY"
+          docker run --rm --entrypoint python "$IMAGE" /app/scripts/validate.py
+
+      - name: Runtime candidate smoke (10 UI WebSockets)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          rm -rf .g9b-ci-data
+          mkdir .g9b-ci-data
+          uidgid="$(id -u):$(id -g)"
+          docker rm -f nova-g9b-ci >/dev/null 2>&1 || true
+          docker run -d --name nova-g9b-ci \
+            --memory=384m --memory-swap=384m --pids-limit=256 \
+            --read-only --tmpfs /tmp:rw,noexec,nosuid,size=32m \
+            --user "$uidgid" \
+            -e NOVA_CANDIDATE_MODE=1 -e NOVA_OFFLINE=0 \
+            -e NOVA_DATA_DIR=/app/data/nova30 \
+            -e NOVA_LEGACY_DATA_DIR=/app/data/nova30/legacy_bridge \
+            -v "$PWD/.g9b-ci-data:/app/data/nova30" \
+            "$IMAGE"
+          trap 'docker logs --tail 120 nova-g9b-ci || true; docker rm -f nova-g9b-ci >/dev/null 2>&1 || true' EXIT
+          for _ in $(seq 1 120); do
+            docker exec nova-g9b-ci python -c "import json,urllib.request,sys;j=json.load(urllib.request.urlopen('http://127.0.0.1:8000/api/readyz',timeout=2));sys.exit(0 if j.get('ok') else 1)" >/dev/null 2>&1 && break
+            sleep .5
+          done
+          docker exec nova-g9b-ci python -c "import json,urllib.request;j=json.load(urllib.request.urlopen('http://127.0.0.1:8000/api/readyz',timeout=2));assert j.get('ok') and j.get('version')=='NOVA-3.1.2-MASTER-GROUNDUP-9B',j;print(j)"
+          docker exec nova-g9b-ci env PYTHONPATH=/app python /app/scripts/runtime_smoke.py --clients 10 --ready-timeout 10
+          docker exec nova-g9b-ci python -c "import json,urllib.request;j=json.load(urllib.request.urlopen('http://127.0.0.1:8000/api/realtime-health',timeout=3));m=j.get('memory') or {};assert float(m.get('swap_mb') or 0)==0,m;assert float(m.get('rss_mb') or 0)<320,m;print('CI_MEMORY=PASS',m)"
+          test "$(docker inspect -f '{{.State.OOMKilled}}' nova-g9b-ci)" = "false"
+          test "$(docker inspect -f '{{.RestartCount}}' nova-g9b-ci)" = "0"
+          docker rm -f nova-g9b-ci >/dev/null
+          trap - EXIT
+
+      - name: HTTP guard auth-cache + WebSocket integration gate
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          NET=nova-g9b-guard-ci-net
+          APP=nova-g9b-guard-app
+          GUARD=nova-g9b-guard-proxy
+          DATA="$PWD/.g9b-guard-data"
+          rm -rf "$DATA"; mkdir "$DATA"
+          docker rm -f "$APP" "$GUARD" >/dev/null 2>&1 || true
+          docker network rm "$NET" >/dev/null 2>&1 || true
+          docker network create "$NET" >/dev/null
+          trap 'docker logs --tail 120 "$APP" 2>/dev/null || true; docker logs --tail 120 "$GUARD" 2>/dev/null || true; docker rm -f "$APP" "$GUARD" >/dev/null 2>&1 || true; docker network rm "$NET" >/dev/null 2>&1 || true' EXIT
+          uidgid="$(id -u):$(id -g)"
+          docker run -d --name "$APP" --network "$NET" \
+            --read-only --tmpfs /tmp:rw,noexec,nosuid,size=32m --user "$uidgid" \
+            -e APP_ACCESS_TOKEN=ci-secret -e NOVA_CANDIDATE_MODE=1 -e NOVA_OFFLINE=0 \
+            -e NOVA_DATA_DIR=/app/data/nova30 -e NOVA_LEGACY_DATA_DIR=/app/data/nova30/legacy_bridge \
+            -v "$DATA:/app/data/nova30" "$IMAGE" >/dev/null
+          for _ in $(seq 1 100); do
+            docker exec "$APP" python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/livez',timeout=2)" >/dev/null 2>&1 && break
+            sleep .2
+          done
+          docker run -d --name "$GUARD" --network "$NET" \
+            --entrypoint python \
+            -e NOVA_UPSTREAM="http://$APP:8000" -e GUARD_PORT=8080 \
+            -e NOVA_STATIC_DIR=/app/static -e NOVA_CACHE_DIR=/tmp/nova-guard-cache \
+            "$IMAGE" /app/ops/http_guard_v2.py >/dev/null
+          for _ in $(seq 1 100); do
+            docker exec "$GUARD" python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/_guard/health',timeout=2)" >/dev/null 2>&1 && break
+            sleep .2
+          done
+          docker exec -i "$GUARD" python - <<'PY'
+          import json,urllib.request
+          URL='http://127.0.0.1:8080/api/auth/check'
+          def q(headers=None):
+              req=urllib.request.Request(URL,headers=headers or {})
+              with urllib.request.urlopen(req,timeout=3) as r:return json.load(r)
+          a=q()
+          b=q({'X-App-Token':'ci-secret'})
+          c=q()
+          d=q({'Authorization':'Bearer ci-secret'})
+          e=q()
+          assert a=={'ok':False,'auth_required':True},a
+          assert b=={'ok':True,'auth_required':True},b
+          assert c=={'ok':False,'auth_required':True},c
+          assert d=={'ok':True,'auth_required':True},d
+          assert e=={'ok':False,'auth_required':True},e
+          print('GUARD_AUTH_DUAL_HEADER_NO_CACHE=PASS')
+          PY
+          docker exec -i "$APP" python - <<'PY'
+          import asyncio,json,websockets
+          async def main():
+              async with websockets.connect('ws://nova-g9b-guard-proxy:8080/ws/live?token=ci-secret',open_timeout=5,close_timeout=2) as ws:
+                  raw=await asyncio.wait_for(ws.recv(),5)
+                  j=json.loads(raw)
+                  assert j.get('type') in ('snapshot','delta'),j
+                  print('GUARD_WS_TUNNEL=PASS',j.get('type'),j.get('generation'))
+          asyncio.run(main())
+          PY
+          docker rm -f "$APP" "$GUARD" >/dev/null
+          docker network rm "$NET" >/dev/null
+          trap - EXIT
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push only after all gates pass
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          shortsha="${GITHUB_SHA:0:12}"
+          docker push "$IMAGE"
+          docker push "ghcr.io/bbblaprk-svg/kiwoom-smartmoney-daytrader:sha-$shortsha"
+          docker pull "$IMAGE"
+          digest="$(docker image inspect -f '{{index .RepoDigests 0}}' "$IMAGE")"
+          echo "IMAGE_DIGEST=$digest"
+          {
+            echo '## QUANT NOVA G9B image published'
+            echo
+            echo "- Image: \`$IMAGE\`"
+            echo "- Source ZIP SHA256: \`$SOURCE_ZIP_SHA256\`"
+            echo "- Repo digest: \`$digest\`"
+            echo '- Lightsail deployment model: pull-only (no docker build on the 1 GB host)'
+            echo '- If the GHCR package is private, provide GHCR_USER and a read:packages GHCR_TOKEN to the installer.'
+          } >> "$GITHUB_STEP_SUMMARY"
