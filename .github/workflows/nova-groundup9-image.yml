@@ -1,0 +1,122 @@
+name: QUANT NOVA G9 image
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'QUANT_NOVA_3.1.0_MASTER_GROUNDUP_9.zip'
+      - '.github/workflows/nova-groundup9-image.yml'
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  SOURCE_ZIP: QUANT_NOVA_3.1.0_MASTER_GROUNDUP_9.zip
+  SOURCE_ZIP_SHA256: 1f3161d4e9e12614c19dd164cc8969095de4dd38c564ca08e40862748f87a568
+  IMAGE: ghcr.io/bbblaprk-svg/kiwoom-smartmoney-daytrader:nova-3.1.0-master-groundup-9
+
+jobs:
+  build-test-publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify immutable source ZIP
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test -f "$SOURCE_ZIP"
+          actual="$(sha256sum "$SOURCE_ZIP" | awk '{print $1}')"
+          echo "EXPECTED=$SOURCE_ZIP_SHA256"
+          echo "ACTUAL=$actual"
+          test "$actual" = "$SOURCE_ZIP_SHA256"
+          unzip -t "$SOURCE_ZIP"
+          rm -rf .g9-build
+          mkdir .g9-build
+          unzip -q "$SOURCE_ZIP" -d .g9-build
+          test -f .g9-build/nova3100/Dockerfile
+          (cd .g9-build/nova3100 && sha256sum -c SOURCE_MANIFEST.sha256)
+
+      - name: Build immutable image (tests execute inside Dockerfile)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          created="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          shortsha="${GITHUB_SHA:0:12}"
+          docker build --pull --no-cache \
+            --build-arg BUILD_GIT_SHA="$GITHUB_SHA" \
+            --build-arg SOURCE_ZIP_SHA="$SOURCE_ZIP_SHA256" \
+            --build-arg BUILD_CREATED_AT="$created" \
+            -t "$IMAGE" \
+            -t "ghcr.io/bbblaprk-svg/kiwoom-smartmoney-daytrader:sha-$shortsha" \
+            .g9-build/nova3100
+
+      - name: Verify image identity and full synthetic validation
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test "$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.version"}}' "$IMAGE")" = "NOVA-3.1.0-MASTER-GROUNDUP-9"
+          test "$(docker image inspect -f '{{index .Config.Labels "io.quantnova.source_zip_sha256"}}' "$IMAGE")" = "$SOURCE_ZIP_SHA256"
+          test "$(docker image inspect -f '{{index .Config.Labels "io.quantnova.deploy_model"}}' "$IMAGE")" = "GHCR_PULL_ONLY"
+          docker run --rm --entrypoint python "$IMAGE" /app/scripts/validate.py
+
+      - name: Runtime candidate smoke (10 UI WebSockets)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          rm -rf .g9-ci-data
+          mkdir .g9-ci-data
+          uidgid="$(id -u):$(id -g)"
+          docker rm -f nova-g9-ci >/dev/null 2>&1 || true
+          docker run -d --name nova-g9-ci \
+            --memory=384m --memory-swap=384m --pids-limit=256 \
+            --read-only --tmpfs /tmp:rw,noexec,nosuid,size=32m \
+            --user "$uidgid" \
+            -e NOVA_CANDIDATE_MODE=1 -e NOVA_OFFLINE=0 \
+            -e NOVA_DATA_DIR=/app/data/nova30 \
+            -e NOVA_LEGACY_DATA_DIR=/app/data/nova30/legacy_bridge \
+            -v "$PWD/.g9-ci-data:/app/data/nova30" \
+            "$IMAGE"
+          trap 'docker logs --tail 120 nova-g9-ci || true; docker rm -f nova-g9-ci >/dev/null 2>&1 || true' EXIT
+          for _ in $(seq 1 120); do
+            docker exec nova-g9-ci python -c "import json,urllib.request,sys;j=json.load(urllib.request.urlopen('http://127.0.0.1:8000/api/readyz',timeout=2));sys.exit(0 if j.get('ok') else 1)" >/dev/null 2>&1 && break
+            sleep .5
+          done
+          docker exec nova-g9-ci python -c "import json,urllib.request;j=json.load(urllib.request.urlopen('http://127.0.0.1:8000/api/readyz',timeout=2));assert j.get('ok') and j.get('version')=='NOVA-3.1.0-MASTER-GROUNDUP-9',j;print(j)"
+          docker exec nova-g9-ci env PYTHONPATH=/app python /app/scripts/runtime_smoke.py --clients 10 --ready-timeout 10
+          docker exec nova-g9-ci python -c "import json,urllib.request;j=json.load(urllib.request.urlopen('http://127.0.0.1:8000/api/realtime-health',timeout=3));m=j.get('memory') or {};assert float(m.get('swap_mb') or 0)==0,m;assert float(m.get('rss_mb') or 0)<320,m;print('CI_MEMORY=PASS',m)"
+          test "$(docker inspect -f '{{.State.OOMKilled}}' nova-g9-ci)" = "false"
+          test "$(docker inspect -f '{{.RestartCount}}' nova-g9-ci)" = "0"
+          docker rm -f nova-g9-ci >/dev/null
+          trap - EXIT
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push only after all gates pass
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          shortsha="${GITHUB_SHA:0:12}"
+          docker push "$IMAGE"
+          docker push "ghcr.io/bbblaprk-svg/kiwoom-smartmoney-daytrader:sha-$shortsha"
+          docker pull "$IMAGE"
+          digest="$(docker image inspect -f '{{index .RepoDigests 0}}' "$IMAGE")"
+          echo "IMAGE_DIGEST=$digest"
+          {
+            echo '## QUANT NOVA G9 image published'
+            echo
+            echo "- Image: \`$IMAGE\`"
+            echo "- Source ZIP SHA256: \`$SOURCE_ZIP_SHA256\`"
+            echo "- Repo digest: \`$digest\`"
+            echo '- Lightsail deployment model: pull-only (no docker build on the 1 GB host)'
+            echo '- If the GHCR package is private, provide GHCR_USER and a read:packages GHCR_TOKEN to the installer.'
+          } >> "$GITHUB_STEP_SUMMARY"
