@@ -1,23 +1,23 @@
-name: QUANT NOVA G10R3 OVERNIGHT SAFE release image
+name: QUANT NOVA G10R3 CLOSE TRUTH release image
 
 on:
   workflow_dispatch:
   push:
     branches: [main]
     paths:
-      - 'QUANT_NOVA_3.2.2_MASTER_GROUNDUP_10R3_OVERNIGHT_SAFE.zip'
+      - 'QUANT_NOVA_3.2.2_MASTER_GROUNDUP_10R3_CLOSE_TRUTH.zip'
       - '.github/workflows/nova-groundup10r3-release.yml'
 
 permissions:
   contents: write
 
 env:
-  SOURCE_ZIP: QUANT_NOVA_3.2.2_MASTER_GROUNDUP_10R3_OVERNIGHT_SAFE.zip
-  SOURCE_ZIP_SHA256: e58b231d101a181de4f3d716dacd7f6b3e02866d83222fc75f0450bde43227d0
+  SOURCE_ZIP: QUANT_NOVA_3.2.2_MASTER_GROUNDUP_10R3_CLOSE_TRUTH.zip
+  SOURCE_ZIP_SHA256: 76d32c78002c9ed792d2aada99510fd28365b4371143bdac9c695007ae99f26b
   APP_VERSION: NOVA-3.2.2-MASTER-GROUNDUP-10R3
-  IMAGE: ghcr.io/bbblaprk-svg/kiwoom-smartmoney-daytrader:nova-3.2.2-master-groundup-10r3-overnight-safe
-  RELEASE_TAG: nova-3.2.2-master-groundup-10r3-overnight-safe
-  ASSET: quant-nova-3.2.2-master-groundup-10r3-overnight-safe-image.tar.gz
+  IMAGE: ghcr.io/bbblaprk-svg/kiwoom-smartmoney-daytrader:nova-3.2.2-master-groundup-10r3-close-truth
+  RELEASE_TAG: nova-3.2.2-master-groundup-10r3-close-truth
+  ASSET: quant-nova-3.2.2-master-groundup-10r3-close-truth-image.tar.gz
 
 jobs:
   build-test-release:
@@ -45,14 +45,14 @@ jobs:
           grep -q 'startWatchdog' "$ROOT/static/nova.js"
           grep -q 'def get_fresh' "$ROOT/app/runtime/display.py"
           grep -q 'READ_THROUGH' "$ROOT/app/runtime/display.py"
-          grep -q 'EOD_FROZEN_LAST_ACTIVE' "$ROOT/app/runtime/display.py"
-          grep -q 'EOD_FROZEN_LAST_TRADE' "$ROOT/app/runtime/projection.py"
-          grep -q "s >= 20\*3600 or s < 8\*3600" "$ROOT/app/runtime/clock.py"
-          grep -q "if sessions()\['active'\]" "$ROOT/app/service.py"
           grep -q 'NOVA_HTTP_LIVE_BRIDGE_V1' "$ROOT/ops/http_guard_v2.py"
           grep -q 'UPSTREAM_SINGLE_SOURCE' "$ROOT/ops/http_guard_v2.py"
           ! grep -q '_static_mem' "$ROOT/ops/http_guard_v2.py"
           grep -q 'v=3220' "$ROOT/static/index.html"
+          grep -q 'SESSION_CLOSE_FROZEN' "$ROOT/app/runtime/projection.py"
+          grep -q 'snapshot_has_truth' "$ROOT/app/runtime/display.py"
+          grep -q '7\*3600+30\*60' "$ROOT/app/runtime/clock.py"
+          grep -q "v.last_price=float(x.get('last_price')" "$ROOT/app/storage/runtime_store.py"
 
       - name: Build immutable image
         shell: bash
@@ -75,19 +75,13 @@ jobs:
           test "$(docker image inspect -f '{{index .Config.Labels "io.quantnova.http_guard_model"}}' "$IMAGE")" = "LIVE_BRIDGE_V1_SINGLE_SOURCE"
           docker run --rm --entrypoint python "$IMAGE" /app/scripts/master_audit.py
           docker run --rm --entrypoint python "$IMAGE" /app/scripts/validate.py
-          docker run --rm --entrypoint python "$IMAGE" -m unittest -v \
-            tests.test_core.GroundupCoreTests.test_groundup10r3_overnight_phase_is_frozen_after_20 \
-            tests.test_core.GroundupCoreTests.test_groundup10r3_closed_display_is_pure_and_prefers_last_active_fallback \
-            tests.test_core.GroundupCoreTests.test_groundup10r3_closed_display_can_synthesize_price_when_fallback_corrupt \
-            tests.test_core.GroundupCoreTests.test_groundup10r3_filters_top5_events_created_outside_market_session \
-            tests.test_core.GroundupCoreTests.test_groundup10r3_detail_history_filters_closed_top5_artifacts \
-            tests.test_core.GroundupCoreTests.test_groundup10r3_restore_keeps_last_market_values_for_frozen_display_only
+          docker run --rm --entrypoint python "$IMAGE" -m unittest tests.test_core.GroundupCloseDisplayTruthTests -v
 
       - name: Prove server to public dashboard bridge
         shell: bash
         run: |
           set -Eeuo pipefail
-          NET=nova-g10r3-bridge-net; APP=nova-g10r3-app; GUARD=nova-g10r3-guard; DATA="$PWD/.g10r3-data"
+          NET=nova-g10r-bridge-net; APP=nova-g10r-app; GUARD=nova-g10r-guard; DATA="$PWD/.g10r-data"
           rm -rf "$DATA"; mkdir "$DATA"
           docker rm -f "$APP" "$GUARD" >/dev/null 2>&1 || true
           docker network rm "$NET" >/dev/null 2>&1 || true
@@ -104,7 +98,7 @@ jobs:
           for _ in $(seq 1 100); do docker exec "$GUARD" python -c "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8080/_guard/health',timeout=2)" >/dev/null 2>&1 && break; sleep .2; done
           docker exec -i "$APP" python - <<'PY'
           import asyncio,json,time,urllib.request,websockets
-          D='http://127.0.0.1:8000';P='http://nova-g10r3-guard:8080'
+          D='http://127.0.0.1:8000';P='http://nova-g10r-guard:8080'
           def get(base,path):
               with urllib.request.urlopen(base+path,timeout=3) as r:return r.status,dict(r.headers),json.loads(r.read())
           assert get(P,'/api/auth/check')[2]=={'ok':True,'auth_required':False}
@@ -123,7 +117,7 @@ jobs:
           assert 'NOVA_LIVE_BRIDGE_V1' in js and 'startWatchdog' in js and 'no-store' in cc
           async def wscheck():
               gens=[]
-              async with websockets.connect('ws://nova-g10r3-guard:8080/ws/live',open_timeout=5,close_timeout=2) as ws:
+              async with websockets.connect('ws://nova-g10r-guard:8080/ws/live',open_timeout=5,close_timeout=2) as ws:
                   for _ in range(3):
                       j=json.loads(await asyncio.wait_for(ws.recv(),4));assert j.get('type')=='snapshot',j;gens.append(int(j['generation']));assert time.time()-float(j['generated_at'])<3
               assert gens==sorted(gens) and len(set(gens))==3,gens
@@ -140,16 +134,16 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          DATA="$PWD/.g10r3-smoke"; rm -rf "$DATA"; mkdir "$DATA"
-          uidgid="$(id -u):$(id -g)"; docker rm -f nova-g10r3-smoke >/dev/null 2>&1 || true
-          docker run -d --name nova-g10r3-smoke --memory=384m --memory-swap=384m --pids-limit=256 --read-only --tmpfs /tmp:rw,noexec,nosuid,size=32m --user "$uidgid" \
+          DATA="$PWD/.g10r-smoke"; rm -rf "$DATA"; mkdir "$DATA"
+          uidgid="$(id -u):$(id -g)"; docker rm -f nova-g10r-smoke >/dev/null 2>&1 || true
+          docker run -d --name nova-g10r-smoke --memory=384m --memory-swap=384m --pids-limit=256 --read-only --tmpfs /tmp:rw,noexec,nosuid,size=32m --user "$uidgid" \
             -e NOVA_CANDIDATE_MODE=1 -e NOVA_OFFLINE=1 -e NOVA_DATA_DIR=/app/data/nova30 -e NOVA_LEGACY_DATA_DIR=/app/data/nova30/legacy_bridge -v "$DATA:/app/data/nova30" "$IMAGE" >/dev/null
-          trap 'docker logs --tail 120 nova-g10r3-smoke || true; docker rm -f nova-g10r3-smoke >/dev/null 2>&1 || true' EXIT
-          for _ in $(seq 1 100); do docker exec nova-g10r3-smoke python -c "import json,urllib.request,sys;j=json.load(urllib.request.urlopen('http://127.0.0.1:8000/api/readyz',timeout=2));sys.exit(0 if j.get('ok') else 1)" >/dev/null 2>&1 && break;sleep .2;done
-          docker exec nova-g10r3-smoke env PYTHONPATH=/app python /app/scripts/runtime_smoke.py --clients 10 --ready-timeout 10
-          test "$(docker inspect -f '{{.State.OOMKilled}}' nova-g10r3-smoke)" = false
-          test "$(docker inspect -f '{{.RestartCount}}' nova-g10r3-smoke)" = 0
-          docker rm -f nova-g10r3-smoke >/dev/null; trap - EXIT
+          trap 'docker logs --tail 120 nova-g10r-smoke || true; docker rm -f nova-g10r-smoke >/dev/null 2>&1 || true' EXIT
+          for _ in $(seq 1 100); do docker exec nova-g10r-smoke python -c "import json,urllib.request,sys;j=json.load(urllib.request.urlopen('http://127.0.0.1:8000/api/readyz',timeout=2));sys.exit(0 if j.get('ok') else 1)" >/dev/null 2>&1 && break;sleep .2;done
+          docker exec nova-g10r-smoke env PYTHONPATH=/app python /app/scripts/runtime_smoke.py --clients 10 --ready-timeout 10
+          test "$(docker inspect -f '{{.State.OOMKilled}}' nova-g10r-smoke)" = false
+          test "$(docker inspect -f '{{.RestartCount}}' nova-g10r-smoke)" = 0
+          docker rm -f nova-g10r-smoke >/dev/null; trap - EXIT
 
       - name: Export tested Docker image
         shell: bash
@@ -173,8 +167,8 @@ jobs:
           else
             gh release create "$RELEASE_TAG" "$ASSET" "$ASSET.sha256" \
               --target "$GITHUB_SHA" \
-              --title "QUANT NOVA 3.2.2 G10R3 Overnight Safe" \
-              --notes "Immutable tested Docker image for QUANT NOVA 3.2.2 G10R3. Adds 20:00-08:00 frozen-display retention, closed-session TOP5 side-effect suppression, restored last-trade display values, and public release asset deployment."
+              --title "QUANT NOVA 3.2.2 G10R3 Close Truth" \
+              --notes "Immutable tested Docker image for QUANT NOVA 3.2.2 G10R3. Preserves frozen close display truth through 07:30 while keeping live-market stale fail-closed behavior."
           fi
           echo '## G10R3 public release asset published' >> "$GITHUB_STEP_SUMMARY"
           echo "- Release tag: $RELEASE_TAG" >> "$GITHUB_STEP_SUMMARY"
