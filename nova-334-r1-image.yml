@@ -1,0 +1,133 @@
+name: QUANT NOVA 3.3.4 R1 image
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'QUANT_NOVA_3.3.4_MARKET_WIDE_ROTATION_VERIFY_R1_SOURCE_20260816.zip'
+      - '.github/workflows/nova-334-r1-image.yml'
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  SOURCE_ZIP: QUANT_NOVA_3.3.4_MARKET_WIDE_ROTATION_VERIFY_R1_SOURCE_20260816.zip
+  SOURCE_ZIP_SHA256: e14a4eb270da824df5463892d32084fae6c6255feb6120a4646df0801073932e
+  SOURCE_TREE_SHA256: faac2fdb03030dd2562f203bcb0943aec6bd369b285c7db3a1a2b81b642dba36
+  SOURCE_DIR: .nova334-build/QUANT_NOVA_3.3.4_MARKET_WIDE_ROTATION_VERIFY_R1_DATA_GAP_GUARD_SOURCE_20260816
+  IMAGE: ghcr.io/bbblaprk-svg/kiwoom-smartmoney-daytrader:nova-3.3.4-market-wide-rotation-verify-r1
+
+jobs:
+  build-test-publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify immutable source ZIP
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test -f "$SOURCE_ZIP"
+          actual="$(sha256sum "$SOURCE_ZIP" | awk '{print $1}')"
+          echo "EXPECTED=$SOURCE_ZIP_SHA256"
+          echo "ACTUAL=$actual"
+          test "$actual" = "$SOURCE_ZIP_SHA256"
+          unzip -t "$SOURCE_ZIP"
+          rm -rf .nova334-build
+          mkdir .nova334-build
+          unzip -q "$SOURCE_ZIP" -d .nova334-build
+          test -f "$SOURCE_DIR/Dockerfile"
+          test "$(sha256sum "$SOURCE_DIR/SOURCE_MANIFEST.sha256" | awk '{print $1}')" = "$SOURCE_TREE_SHA256"
+          (cd "$SOURCE_DIR" && sha256sum -c SOURCE_MANIFEST.sha256)
+
+      - name: Build immutable image (tests execute inside Dockerfile)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          created="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          shortsha="${GITHUB_SHA:0:12}"
+          docker build --pull --no-cache \
+            --build-arg BUILD_GIT_SHA="$GITHUB_SHA" \
+            --build-arg SOURCE_ZIP_SHA="$SOURCE_ZIP_SHA256" \
+            --build-arg SOURCE_TREE_SHA="$SOURCE_TREE_SHA256" \
+            --build-arg BUILD_CREATED_AT="$created" \
+            -t "$IMAGE" \
+            -t "ghcr.io/bbblaprk-svg/kiwoom-smartmoney-daytrader:sha-$shortsha" \
+            "$SOURCE_DIR"
+
+      - name: Verify image identity and synthetic validation
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test "$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.version"}}' "$IMAGE")" = "NOVA-3.3.4-MARKET-WIDE-ROTATION-VERIFY"
+          test "$(docker image inspect -f '{{index .Config.Labels "io.quantnova.source_zip_sha256"}}' "$IMAGE")" = "$SOURCE_ZIP_SHA256"
+          test "$(docker image inspect -f '{{index .Config.Labels "io.quantnova.source_tree_sha256"}}' "$IMAGE")" = "$SOURCE_TREE_SHA256"
+          test "$(docker image inspect -f '{{index .Config.Labels "io.quantnova.deploy_model"}}' "$IMAGE")" = "GHCR_PULL_ONLY"
+          docker run --rm --entrypoint python "$IMAGE" /app/scripts/validate.py
+          docker run --rm --entrypoint python "$IMAGE" /app/scripts/max_profit_acceptance.py
+          docker run --rm --entrypoint python "$IMAGE" /app/scripts/market_rotation_acceptance.py
+
+      - name: Runtime candidate smoke (10 UI WebSockets)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          rm -rf .nova334-ci-data
+          mkdir .nova334-ci-data
+          uidgid="$(id -u):$(id -g)"
+          docker rm -f nova334-ci >/dev/null 2>&1 || true
+          docker run -d --name nova334-ci \
+            --network none \
+            --memory=384m --memory-swap=384m --pids-limit=256 \
+            --read-only --tmpfs /tmp:rw,noexec,nosuid,size=32m \
+            --user "$uidgid" \
+            -e NOVA_CANDIDATE_MODE=1 -e NOVA_OFFLINE=0 \
+            -e NOVA_DATA_DIR=/app/data/nova30 \
+            -e NOVA_LEGACY_DATA_DIR=/app/data/nova30/legacy_bridge \
+            -v "$PWD/.nova334-ci-data:/app/data/nova30" \
+            "$IMAGE"
+          trap 'docker logs --tail 160 nova334-ci || true; docker rm -f nova334-ci >/dev/null 2>&1 || true' EXIT
+          for _ in $(seq 1 120); do
+            docker exec nova334-ci python -c "import json,urllib.request,sys;j=json.load(urllib.request.urlopen('http://127.0.0.1:8000/api/readyz',timeout=2));sys.exit(0 if j.get('ok') else 1)" >/dev/null 2>&1 && break
+            sleep .5
+          done
+          docker exec nova334-ci python -c "import json,urllib.request;j=json.load(urllib.request.urlopen('http://127.0.0.1:8000/api/readyz',timeout=2));assert j.get('ok') and j.get('version')=='NOVA-3.3.4-MARKET-WIDE-ROTATION-VERIFY',j;print('CANDIDATE_READYZ=PASS',j)"
+          docker exec nova334-ci env PYTHONPATH=/app python /app/scripts/runtime_smoke.py --clients 10 --ready-timeout 10
+          docker exec nova334-ci env PYTHONPATH=/app python /app/scripts/master_audit.py
+          docker exec nova334-ci env PYTHONPATH=/app python /app/scripts/max_profit_acceptance.py
+          docker exec nova334-ci env PYTHONPATH=/app python /app/scripts/market_rotation_acceptance.py
+          docker exec nova334-ci python -c "import json,urllib.request;j=json.load(urllib.request.urlopen('http://127.0.0.1:8000/api/realtime-health',timeout=3));m=j.get('memory') or {};assert float(m.get('swap_mb') or 0)==0,m;assert float(m.get('rss_mb') or 0)<320,m;print('CI_MEMORY=PASS',m)"
+          test "$(docker inspect -f '{{.State.OOMKilled}}' nova334-ci)" = "false"
+          test "$(docker inspect -f '{{.RestartCount}}' nova334-ci)" = "0"
+          docker rm -f nova334-ci >/dev/null
+          trap - EXIT
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push only after all gates pass
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          shortsha="${GITHUB_SHA:0:12}"
+          docker push "$IMAGE"
+          docker push "ghcr.io/bbblaprk-svg/kiwoom-smartmoney-daytrader:sha-$shortsha"
+          docker pull "$IMAGE"
+          digest="$(docker image inspect -f '{{index .RepoDigests 0}}' "$IMAGE")"
+          echo "IMAGE_DIGEST=$digest"
+          {
+            echo '## QUANT NOVA 3.3.4 R1 image published'
+            echo
+            echo "- Image: \`$IMAGE\`"
+            echo "- Source ZIP SHA256: \`$SOURCE_ZIP_SHA256\`"
+            echo "- Source tree SHA256: \`$SOURCE_TREE_SHA256\`"
+            echo "- Repo digest: \`$digest\`"
+            echo '- Lightsail deployment model: pull-only (no docker build on the 1 GB host)'
+          } >> "$GITHUB_STEP_SUMMARY"
