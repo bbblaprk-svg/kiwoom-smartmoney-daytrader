@@ -339,7 +339,7 @@ dc exec "$CANDIDATE" env PYTHONPATH=/app python /app/scripts/market_rotation_acc
 dc exec "$CANDIDATE" env PYTHONPATH=/app python /app/scripts/r42_fresh_scout_acceptance.py | tee -a "$LOG"
 dc exec "$CANDIDATE" env PYTHONPATH=/app python /app/scripts/r492_safe_extension_acceptance.py | tee -a "$LOG"
 dc exec "$CANDIDATE" env PYTHONPATH=/app python /app/scripts/r492_market_index_verify_acceptance.py | tee -a "$LOG"
-dc exec "$CANDIDATE" env PYTHONPATH=/app python -m unittest tests.test_r49_signal_acceleration tests.test_r492_market_index_verify -q | tee -a "$LOG"
+dc exec "$CANDIDATE" env NOVA_OFFLINE=0 NOVA_CANDIDATE_MODE=0 NOVA_MARKET_INDEX_VERIFY_ENABLED=1 PYTHONPATH=/app python -m unittest tests.test_r49_signal_acceleration tests.test_r492_market_index_verify -q | tee -a "$LOG"
 dc exec "$CANDIDATE" env PYTHONPATH=/app python /app/scripts/runtime_smoke.py --clients 2 --ready-timeout 30 | tee -a "$LOG"
 dc rm -f "$CANDIDATE" >/dev/null
 CAND_STARTED=0
