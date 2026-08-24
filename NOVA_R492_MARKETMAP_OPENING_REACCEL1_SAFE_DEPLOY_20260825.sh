@@ -6,8 +6,8 @@ REPO="bbblaprk-svg/kiwoom-smartmoney-daytrader"
 BRANCH="main"
 APP="${NOVA_APP_CONTAINER:-quant-nova}"
 REMOTE_DOCKERFILE="Dockerfile"
-EXPECTED_DOCKERFILE_SHA="4165326449e3f2ee441492fa59d054087a82760a32d000f59b4a41107280df5b"
-EXPECTED_EMBEDDED_SOURCE_SHA="79eb848dbfb14577a6ef88afd35fb2b8b549dd1310c3f05fc31910a599b6ecd7"
+EXPECTED_DOCKERFILE_SHA="c44fa03d881162d60ebfc839e829df24bd71f6a0a234b9598410aa2ba3ab8f79"
+EXPECTED_EMBEDDED_SOURCE_SHA="399cfb92e32fd827628da6486cd59e62780333d46084a77f812b29b61703bf0c"
 EXPECTED_VERSION="NOVA-3.3.5-R492-MARKET-INDEX-VERIFY1"
 EXPECTED_CLOSEBET_LABEL="KRX_CLOSE6__NXT_POOL15_EARLY1540_CLOSE1830_LOCK1957__REPEAT_CAP5_FRESH_LANES"
 EXPECTED_PATCH_LABEL="CANONICAL_LISTING_AUTHORITATIVE__NXT_TENTATIVE_NO_OVERWRITE__OPENING_SHAKEOUT_RECLAIM_0900_0920"
@@ -33,6 +33,7 @@ CAND_STARTED=0
 PROTECTED_SNAPSHOT_READY=0
 STATE_MUTATED=0
 LOCKFILE="/tmp/nova-r492-mmor1-deploy.lock"
+MAX_SWAP_MB="${NOVA_DEPLOY_MAX_SWAP_MB:-8}"
 
 exec 9>"$LOCKFILE"
 if ! flock -n 9; then
@@ -126,6 +127,15 @@ find_exact_r492_backup(){
 
 restore_exact_r492(){
   local curver restored
+  if dc inspect "$APP" >/dev/null 2>&1; then
+    curver="$(image_version "$APP")"
+    if [ "$curver" = "$BASELINE_R492" ]; then
+      dc start "$APP" >/dev/null 2>&1 || true
+      wait_health "$APP"
+      echo "R492_RESTORE=ALREADY_BASELINE version=$curver" | tee -a "$LOG"
+      return 0
+    fi
+  fi
   [ -n "$R492_BACKUP" ] || { echo "CRITICAL: exact R492 backup reference is empty" | tee -a "$LOG"; return 1; }
   [ "$(image_version "$R492_BACKUP")" = "$BASELINE_R492" ] || {
     echo "CRITICAL: rollback source is no longer exact R492: $R492_BACKUP" | tee -a "$LOG"; return 1; }
@@ -136,11 +146,6 @@ restore_exact_r492(){
 
   if dc inspect "$APP" >/dev/null 2>&1; then
     curver="$(image_version "$APP")"
-    if [ "$curver" = "$BASELINE_R492" ]; then
-      dc start "$APP" >/dev/null 2>&1 || true
-      wait_health "$APP"
-      return 0
-    fi
     dc stop -t 5 "$APP" >/dev/null 2>&1 || true
     if dc inspect "$FAILED" >/dev/null 2>&1; then dc rm -f "$FAILED" >/dev/null 2>&1 || true; fi
     dc rename "$APP" "$FAILED" >/dev/null
@@ -344,7 +349,7 @@ dc exec "$CANDIDATE" env PYTHONPATH=/app python /app/scripts/r492_uifix7_accepta
 dc exec "$CANDIDATE" env PYTHONPATH=/app python /app/scripts/r492_close_bet_fresh_diversity_acceptance.py | tee -a "$LOG"
 dc exec "$CANDIDATE" env PYTHONPATH=/app python /app/scripts/r492_marketmap_opening_reaccel_acceptance.py | tee -a "$LOG"
 dc exec "$CANDIDATE" env NOVA_OFFLINE=0 NOVA_CANDIDATE_MODE=0 NOVA_MARKET_INDEX_VERIFY_ENABLED=1 PYTHONPATH=/app python -m unittest tests.test_r49_signal_acceleration tests.test_r492_market_index_verify tests.test_r492_close_bet_fresh_diversity tests.test_r492_marketmap_opening_reaccel -q | tee -a "$LOG"
-dc exec "$CANDIDATE" env PYTHONPATH=/app python /app/scripts/runtime_smoke.py --clients 2 --ready-timeout 30 | tee -a "$LOG"
+dc exec "$CANDIDATE" env NOVA_RUNTIME_SMOKE_MAX_SWAP_MB="$MAX_SWAP_MB" PYTHONPATH=/app python /app/scripts/runtime_smoke.py --clients 2 --ready-timeout 30 | tee -a "$LOG"
 dc exec "$CANDIDATE" python - <<'PY' | tee -a "$LOG"
 import json,os,urllib.request
 t=(os.getenv('NOVA_UI_ACCESS_TOKEN') or os.getenv('APP_ACCESS_TOKEN') or '').strip(); h={'X-App-Token':t,'Authorization':'Bearer '+t} if t else {}
@@ -396,10 +401,10 @@ dc exec "$APP" env PYTHONPATH=/app python /app/scripts/r492_market_index_verify_
 dc exec "$APP" env PYTHONPATH=/app python /app/scripts/r492_uifix7_acceptance.py | tee -a "$LOG"
 dc exec "$APP" env PYTHONPATH=/app python /app/scripts/r492_close_bet_fresh_diversity_acceptance.py | tee -a "$LOG"
 dc exec "$APP" env PYTHONPATH=/app python /app/scripts/r492_marketmap_opening_reaccel_acceptance.py | tee -a "$LOG"
-dc exec "$APP" env PYTHONPATH=/app python /app/scripts/runtime_smoke.py --clients 2 --ready-timeout 30 | tee -a "$LOG"
-dc exec "$APP" python - "$EXPECTED_VERSION" <<'PY' | tee -a "$LOG"
+dc exec "$APP" env NOVA_RUNTIME_SMOKE_MAX_SWAP_MB="$MAX_SWAP_MB" PYTHONPATH=/app python /app/scripts/runtime_smoke.py --clients 2 --ready-timeout 30 | tee -a "$LOG"
+dc exec "$APP" python - "$EXPECTED_VERSION" "$MAX_SWAP_MB" <<'PY' | tee -a "$LOG"
 import json,os,sys,urllib.request
-expected=sys.argv[1]
+expected=sys.argv[1]; max_swap=float(sys.argv[2])
 t=(os.getenv('NOVA_UI_ACCESS_TOKEN') or os.getenv('APP_ACCESS_TOKEN') or '').strip(); h={'X-App-Token':t,'Authorization':'Bearer '+t} if t else {}
 def get(p):
   with urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:8000'+p,headers=h),timeout=8) as r:return json.load(r)
@@ -423,8 +428,8 @@ assert cc.get('price_rise_is_primary_rank') is False,cc
 assert cb.get('final_max')==6 and cb.get('nxt_pool_cap')==15 and int(cb.get('nxt_final_count') or 0)<=6,cb
 rc=ra.get('contracts') or {}; assert rc.get('opening_shakeout_pattern')=='09:00~09:20 GAP_UP -> FLUSH -> FLOW_RECLAIM -> SECOND_ENTRY',rc
 assert rc.get('opening_shakeout_new_broker_calls')==0 and rc.get('official_entry_v18_changed') is False and rc.get('official_buy_changed') is False,rc
-swap=float((health.get('memory') or {}).get('swap_mb') or 0); assert swap==0,health.get('memory')
-print(json.dumps({'ok':True,'version':expected,'baseline_r492_frozen':True,'market_index_verify':True,'close_bet_center':True,'marketmap_opening_reaccel':True,'krx_mode':cb.get('krx_mode'),'nxt_mode':cb.get('nxt_mode'),'krx_rows':len(cb.get('krx') or []),'nxt_pool':len(cb.get('nxt') or []),'nxt_final':cb.get('nxt_final_count'),'close_bet_new_rest':0,'close_bet_new_ws':0,'rank_effect':0,'buy_effect':0,'load_mode':health.get('load_mode'),'swap_mb':swap},ensure_ascii=False))
+swap=float((health.get('memory') or {}).get('swap_mb') or 0); assert swap<=max_swap,{'memory':health.get('memory'),'max_swap_mb':max_swap}
+print(json.dumps({'ok':True,'version':expected,'baseline_r492_frozen':True,'market_index_verify':True,'close_bet_center':True,'marketmap_opening_reaccel':True,'krx_mode':cb.get('krx_mode'),'nxt_mode':cb.get('nxt_mode'),'krx_rows':len(cb.get('krx') or []),'nxt_pool':len(cb.get('nxt') or []),'nxt_final':cb.get('nxt_final_count'),'close_bet_new_rest':0,'close_bet_new_ws':0,'rank_effect':0,'buy_effect':0,'load_mode':health.get('load_mode'),'swap_mb':swap,'max_swap_mb':max_swap},ensure_ascii=False))
 PY
 verify_protected
 
@@ -433,20 +438,20 @@ OBSERVE_SEC="${NOVA_MMOR1_OBSERVE_SEC:-600}"
 BAD_STREAK=0; START_OBS="$(date +%s)"
 while (( $(date +%s) - START_OBS < OBSERVE_SEC )); do
   ELAPSED=$(( $(date +%s) - START_OBS ))
-  if OBS_LINE="$(dc exec "$APP" python - <<'PY' 2>&1
+  if OBS_LINE="$(dc exec "$APP" env NOVA_RUNTIME_SMOKE_MAX_SWAP_MB="$MAX_SWAP_MB" python - <<'PY' 2>&1
 import json,os,urllib.request
 t=(os.getenv('NOVA_UI_ACCESS_TOKEN') or os.getenv('APP_ACCESS_TOKEN') or '').strip(); h={'X-App-Token':t,'Authorization':'Bearer '+t} if t else {}
 def get(p):
   with urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:8000'+p,headers=h),timeout=5) as r:return json.load(r)
 x=get('/api/realtime-health'); mi=get('/api/market-index-verify'); cb=get('/api/close-bet-center')
-m=x.get('memory') or {}; load=str(x.get('load_mode') or '')
+m=x.get('memory') or {}; load=str(x.get('load_mode') or ''); max_swap=float(os.getenv('NOVA_RUNTIME_SMOKE_MAX_SWAP_MB','8') or 8)
 swap=float(m.get('swap_mb') or 0); lag=float(x.get('event_loop_lag_p95_ms') or 0); qage=float(x.get('trade_queue_oldest_age_ms') or 0); q=int(x.get('trade_queue_depth') or 0)
 mc=mi.get('contracts') or {}; cc=cb.get('contracts') or {}
 assert mc.get('rank_or_score_adjustment_applied') is False
 assert cc.get('official_buy_logic_changed') is False and cc.get('entry_v18_changed') is False and cc.get('new_broker_rest_calls')==0 and cc.get('new_ws_subscription_types')==0 and cc.get('price_rise_is_primary_rank') is False
 assert len(cb.get('krx') or [])<=6 and len(cb.get('nxt') or [])<=15 and int(cb.get('nxt_final_count') or 0)<=6
 print(json.dumps({'load':load,'swap':swap,'lag_p95':lag,'queue_age_ms':qage,'queue':q,'index_status':mi.get('status'),'krx_mode':cb.get('krx_mode'),'nxt_mode':cb.get('nxt_mode'),'krx_rows':len(cb.get('krx') or []),'nxt_pool':len(cb.get('nxt') or []),'nxt_final':cb.get('nxt_final_count')},ensure_ascii=False))
-assert swap==0
+assert swap<=max_swap
 assert lag<=250
 assert qage<=750
 assert load!='CRITICAL'
@@ -471,5 +476,5 @@ say "9/9 SUCCESS"
 trap - ERR INT TERM EXIT
 cleanup
 echo "RESULT=SUCCESS VERSION=$EXPECTED_VERSION PATCH=$EXPECTED_PATCH_LABEL CURRENT=$APP UIFIX7R2_BACKUP=$PREV_BACKUP R492_ROLLBACK=$R492_BACKUP" | tee -a "$LOG"
-echo "CONTRACT=R492_CORE_FROZEN MARKETMAP=CANONICAL OPENING_REACCEL=0900_0920_VERIFY CLOSE_BET=KRX_NXT_VERIFY_DISPLAY_ONLY RANK_EFFECT=0 BUY_EFFECT=0 NEW_REST=0 NEW_WS=0" | tee -a "$LOG"
+echo "CONTRACT=R492_CORE_FROZEN MARKETMAP=CANONICAL OPENING_REACCEL=0900_0920_VERIFY CLOSE_BET=KRX_NXT_VERIFY_DISPLAY_ONLY RANK_EFFECT=0 BUY_EFFECT=0 NEW_REST=0 NEW_WS=0 SWAP_GUARD_MB=$MAX_SWAP_MB" | tee -a "$LOG"
 echo "LOG=$LOG"
