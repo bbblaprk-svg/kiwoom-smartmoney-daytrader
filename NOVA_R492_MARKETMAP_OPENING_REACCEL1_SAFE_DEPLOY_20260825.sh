@@ -244,12 +244,13 @@ with tempfile.TemporaryDirectory(prefix='nova-r492-mmor1-preflight-') as td:
 print(f'PREFLIGHT_PAYLOAD=PASS chunks={len(parts)} gzip_bytes={len(raw)} gzip_sha256={actual} manifest=PASS protected_core=7 main_dom=UNCHANGED close_bet_pool=15 final_max=6 repeat_cap=5 marketmap=CANONICAL opening_reaccel=0900_0920 new_rest=0 new_ws=0')
 PY
 
-say "2/9 REQUIRE UIFIX7R2 LINEAGE + VERIFY EXACT R492 ROLLBACK SOURCE"
+say "2/9 ACCEPT EXACT R492 BASELINE OR APPROVED UIFIX7R2 LINEAGE + VERIFY ROLLBACK SOURCE"
 dc inspect "$APP" >/dev/null
 CURRENT_VERSION="$(image_version "$APP")"
 CURRENT_CLOSEBET="$(image_label "$APP" io.quantnova.r492_close_bet_fresh_diversity1)"
 CURRENT_PATCH="$(image_label "$APP" io.quantnova.r492_marketmap_opening_reaccel1)"
 CURRENT_UIFIX7="$(image_label "$APP" io.quantnova.r492_uifix7)"
+SOURCE_MODE=""
 echo "current_version=${CURRENT_VERSION:-UNKNOWN} uifix7=${CURRENT_UIFIX7:-NONE} closebet_fresh=${CURRENT_CLOSEBET:-NONE} marketmap_opening=${CURRENT_PATCH:-NONE}" | tee -a "$LOG"
 if [ "$CURRENT_VERSION" = "$EXPECTED_VERSION" ] && [ "$CURRENT_PATCH" = "$EXPECTED_PATCH_LABEL" ]; then
   echo "INFO: MARKET-MAP + OPENING RE-ACCEL1 already deployed. Health/acceptance only." | tee -a "$LOG"
@@ -261,16 +262,25 @@ if [ "$CURRENT_VERSION" = "$EXPECTED_VERSION" ] && [ "$CURRENT_PATCH" = "$EXPECT
   echo "RESULT=ALREADY_DEPLOYED VERSION=$EXPECTED_VERSION PATCH=$EXPECTED_PATCH_LABEL CURRENT=$APP LOG=$LOG"
   exit 0
 fi
-[ "$CURRENT_VERSION" = "$PREREQ_MIV1" ] || { echo "FAIL: current version=$CURRENT_VERSION need=$PREREQ_MIV1; no change" | tee -a "$LOG"; exit 1; }
-[ "$CURRENT_UIFIX7" = "$PREREQ_UIFIX7" ] || { echo "FAIL: current UIFIX7 lineage is not approved UIFIX7R2; no change" | tee -a "$LOG"; exit 1; }
+if [ "$CURRENT_VERSION" = "$BASELINE_R492" ]; then
+  SOURCE_MODE="R492_BASELINE"
+  R492_BACKUP="$APP"
+  echo "SOURCE_MODE=$SOURCE_MODE current app itself is the exact rollback baseline" | tee -a "$LOG"
+elif [ "$CURRENT_VERSION" = "$PREREQ_MIV1" ] && [ "$CURRENT_UIFIX7" = "$PREREQ_UIFIX7" ]; then
+  SOURCE_MODE="UIFIX7R2"
+  wait_health "$APP"
+  dc exec "$APP" env PYTHONPATH=/app python /app/scripts/r492_market_index_verify_acceptance.py | tee -a "$LOG"
+  dc exec "$APP" env PYTHONPATH=/app python /app/scripts/r492_uifix7_acceptance.py | tee -a "$LOG"
+  R492_BACKUP="$(find_exact_r492_backup || true)"
+  [ -n "$R492_BACKUP" ] || {
+    echo "FAIL: 실배포 실패 시 복귀할 정확한 R492 백업 컨테이너를 찾지 못했습니다. 아무것도 변경하지 않습니다." | tee -a "$LOG"; exit 1; }
+  [ "$(image_version "$R492_BACKUP")" = "$BASELINE_R492" ] || { echo "FAIL: R492 backup version mismatch" | tee -a "$LOG"; exit 1; }
+  echo "SOURCE_MODE=$SOURCE_MODE VERIFIED_R492_ROLLBACK_SOURCE=$R492_BACKUP VERSION=$(image_version "$R492_BACKUP")" | tee -a "$LOG"
+else
+  echo "FAIL: unsupported current lineage version=$CURRENT_VERSION uifix7=${CURRENT_UIFIX7:-NONE}; accepted=$BASELINE_R492 OR $PREREQ_MIV1+$PREREQ_UIFIX7; no change" | tee -a "$LOG"
+  exit 1
+fi
 wait_health "$APP"
-dc exec "$APP" env PYTHONPATH=/app python /app/scripts/r492_market_index_verify_acceptance.py | tee -a "$LOG"
-dc exec "$APP" env PYTHONPATH=/app python /app/scripts/r492_uifix7_acceptance.py | tee -a "$LOG"
-R492_BACKUP="$(find_exact_r492_backup || true)"
-[ -n "$R492_BACKUP" ] || {
-  echo "FAIL: 실배포 실패 시 복귀할 정확한 R492 백업 컨테이너를 찾지 못했습니다. 아무것도 변경하지 않습니다." | tee -a "$LOG"; exit 1; }
-[ "$(image_version "$R492_BACKUP")" = "$BASELINE_R492" ] || { echo "FAIL: R492 backup version mismatch" | tee -a "$LOG"; exit 1; }
-echo "VERIFIED_R492_ROLLBACK_SOURCE=$R492_BACKUP VERSION=$(image_version "$R492_BACKUP")" | tee -a "$LOG"
 [ "$(dc inspect "$APP" --format '{{.State.Running}}')" = "true" ] && OLD_WAS_RUNNING=1 || true
 dc inspect "$APP" --format '{{range .Config.Env}}{{println .}}{{end}}' > "$ENVFILE"
 protected_snapshot > "$WORK/protected.before"
@@ -307,10 +317,10 @@ while IFS='|' read -r HOSTIP HOSTPORT CONTAINERPORT; do
 done < <(dc inspect "$APP" --format '{{range $port, $bindings := .NetworkSettings.Ports}}{{range $bindings}}{{println .HostIp "|" .HostPort "|" $port}}{{end}}{{end}}')
 echo "network_mode=$NETWORK_MODE primary_network=$PRIMARY_NETWORK attached_networks=${NETWORKS[*]:-none}" | tee -a "$LOG"
 
-say "3/9 RESOURCE PREFLIGHT; STOP CURRENT UIFIX7R2 ONLY FOR LOW-RAM BUILD"
+say "3/9 RESOURCE PREFLIGHT; STOP CURRENT APPROVED SOURCE ONLY FOR LOW-RAM BUILD"
 FREE_KB="$(df -Pk /var/lib/docker 2>/dev/null | awk 'NR==2{print $4}')"; [ -n "$FREE_KB" ] || FREE_KB="$(df -Pk / | awk 'NR==2{print $4}')"
-echo "pre_stop_free_kb=$FREE_KB" | tee -a "$LOG"
-(( FREE_KB >= 1400000 )) || { echo "FAIL: Docker disk free ${FREE_KB}KB < 1.4GB; current UIFIX7R2 untouched"; exit 1; }
+echo "pre_stop_free_kb=$FREE_KB source_mode=$SOURCE_MODE" | tee -a "$LOG"
+(( FREE_KB >= 1400000 )) || { echo "FAIL: Docker disk free ${FREE_KB}KB < 1.4GB; current approved source untouched"; exit 1; }
 if [ "$OLD_WAS_RUNNING" -eq 1 ]; then dc stop -t 10 "$APP" >/dev/null; OLD_STOPPED=1; STATE_MUTATED=1; fi
 AVAIL_MB="$(free -m | awk '/Mem:/{print $7}')"
 echo "post_stop_available_mb=$AVAIL_MB" | tee -a "$LOG"
@@ -369,14 +379,22 @@ PY
 dc rm -f "$CANDIDATE" >/dev/null
 CAND_STARTED=0
 
-say "5/9 ATOMIC CUTOVER — UIFIX7R2 BACKUP + EXACT R492 BACKUP PRESERVED"
-# Current UIFIX7R2 is already stopped from build.
-[ "$(image_version "$APP")" = "$PREREQ_MIV1" ] || { echo "FAIL: pre-cutover app version changed"; exit 1; }
-[ "$(image_label "$APP" io.quantnova.r492_uifix7)" = "$PREREQ_UIFIX7" ] || { echo "FAIL: pre-cutover UIFIX7 lineage changed"; exit 1; }
+say "5/9 ATOMIC CUTOVER — APPROVED SOURCE BACKUP + EXACT R492 ROLLBACK PRESERVED"
+if [ "$SOURCE_MODE" = "R492_BASELINE" ]; then
+  [ "$(image_version "$APP")" = "$BASELINE_R492" ] || { echo "FAIL: pre-cutover exact R492 baseline changed"; exit 1; }
+else
+  [ "$(image_version "$APP")" = "$PREREQ_MIV1" ] || { echo "FAIL: pre-cutover app version changed"; exit 1; }
+  [ "$(image_label "$APP" io.quantnova.r492_uifix7)" = "$PREREQ_UIFIX7" ] || { echo "FAIL: pre-cutover UIFIX7 lineage changed"; exit 1; }
+fi
 dc rename "$APP" "$PREV_BACKUP"; OLD_RENAMED=1; STATE_MUTATED=1
-[ "$(image_version "$PREV_BACKUP")" = "$PREREQ_MIV1" ] || { echo "FAIL: UIFIX7R2 backup version mismatch"; exit 1; }
-[ "$(image_label "$PREV_BACKUP" io.quantnova.r492_uifix7)" = "$PREREQ_UIFIX7" ] || { echo "FAIL: UIFIX7R2 backup label mismatch"; exit 1; }
-[ "$(dc inspect "$PREV_BACKUP" --format '{{.State.Running}}')" = "false" ] || { echo "FAIL: UIFIX7R2 backup unexpectedly running"; exit 1; }
+if [ "$SOURCE_MODE" = "R492_BASELINE" ]; then
+  R492_BACKUP="$PREV_BACKUP"
+  [ "$(image_version "$PREV_BACKUP")" = "$BASELINE_R492" ] || { echo "FAIL: exact R492 backup version mismatch after rename"; exit 1; }
+else
+  [ "$(image_version "$PREV_BACKUP")" = "$PREREQ_MIV1" ] || { echo "FAIL: UIFIX7R2 backup version mismatch"; exit 1; }
+  [ "$(image_label "$PREV_BACKUP" io.quantnova.r492_uifix7)" = "$PREREQ_UIFIX7" ] || { echo "FAIL: UIFIX7R2 backup label mismatch"; exit 1; }
+fi
+[ "$(dc inspect "$PREV_BACKUP" --format '{{.State.Running}}')" = "false" ] || { echo "FAIL: pre-deploy backup unexpectedly running"; exit 1; }
 [ "$(image_version "$R492_BACKUP")" = "$BASELINE_R492" ] || { echo "FAIL: exact R492 rollback source changed"; exit 1; }
 RUN_ARGS=(run -d --name "$APP" --restart "$RESTART" --network "$PRIMARY_NETWORK" --env-file "$ENVFILE")
 RUN_ARGS+=("${MOUNT_ARGS[@]}")
@@ -469,12 +487,12 @@ verify_protected
 say "8/9 FINAL STATUS"
 dc ps --filter "name=^/${APP}$" --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}' | tee -a "$LOG"
 echo "ACTIVE_VERSION=$(image_version "$APP")" | tee -a "$LOG"
-echo "UIFIX7R2_BACKUP=$PREV_BACKUP VERSION=$(image_version "$PREV_BACKUP")" | tee -a "$LOG"
+echo "PREDEPLOY_BACKUP=$PREV_BACKUP SOURCE_MODE=$SOURCE_MODE VERSION=$(image_version "$PREV_BACKUP")" | tee -a "$LOG"
 echo "R492_HARD_ROLLBACK_SOURCE=$R492_BACKUP VERSION=$(image_version "$R492_BACKUP")" | tee -a "$LOG"
 
 say "9/9 SUCCESS"
 trap - ERR INT TERM EXIT
 cleanup
-echo "RESULT=SUCCESS VERSION=$EXPECTED_VERSION PATCH=$EXPECTED_PATCH_LABEL CURRENT=$APP UIFIX7R2_BACKUP=$PREV_BACKUP R492_ROLLBACK=$R492_BACKUP" | tee -a "$LOG"
+echo "RESULT=SUCCESS VERSION=$EXPECTED_VERSION PATCH=$EXPECTED_PATCH_LABEL CURRENT=$APP SOURCE_MODE=$SOURCE_MODE PREDEPLOY_BACKUP=$PREV_BACKUP R492_ROLLBACK=$R492_BACKUP" | tee -a "$LOG"
 echo "CONTRACT=R492_CORE_FROZEN MARKETMAP=CANONICAL OPENING_REACCEL=0900_0920_VERIFY CLOSE_BET=KRX_NXT_VERIFY_DISPLAY_ONLY RANK_EFFECT=0 BUY_EFFECT=0 NEW_REST=0 NEW_WS=0 SWAP_GUARD_MB=$MAX_SWAP_MB" | tee -a "$LOG"
 echo "LOG=$LOG"
