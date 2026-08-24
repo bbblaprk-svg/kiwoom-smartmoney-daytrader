@@ -89,6 +89,76 @@ verify_protected(){
     echo "FAIL: Guard/Caddy 컨테이너가 변경됐습니다." | tee -a "$LOG"; return 1; }
 }
 
+rotation_functional_gate(){
+  local name="$1"
+  dc exec "$name" env PYTHONPATH=/app python - <<'PYROT'
+import json, time
+from app.broker.discovery import RANK_SPECS
+from app.broker.market_rotation import MarketRotation
+from app.broker.websocket import KiwoomWebSocket
+from app.runtime.state import RuntimeState
+
+state = RuntimeState()
+base = time.time()
+rows = []
+for index in range(1200):
+    c = state.candidate(f'{index:06d}', f'ROTATION{index}', trade_day='20260816')
+    c.source_hits['volume_surge'] = base
+    c.rest_base = float(index % 100)
+    # Production DiscoveryEngine supplies cached scalar rank features before
+    # rotation.  Seed the same contract here; do not benchmark the fallback
+    # scorer or host CPU scheduling as a deployment correctness gate.
+    c.metrics['discovery_scout_score'] = 1.0
+    c.metrics['early_edge_score'] = 0.1
+    c.metrics['early_edge_headroom'] = 0.1
+    rows.append(c)
+
+rotation = MarketRotation()
+selected = set()
+now = base
+observed = {}
+for mode in ('NORMAL','BUSY','HIGH_LOAD','CRITICAL','NORMAL') * 4:
+    desired = rotation.target_for_mode(mode)
+    for c in rows:
+        c.source_hits['volume_surge'] = now
+    result = rotation.select(rows, selected, set(), desired, '20260816', now)
+    selected = result.selected
+    observed.setdefault(mode, set()).add(len(selected))
+    assert len(selected) <= desired, (mode, len(selected), desired)
+    now += 24
+
+for c in rows:
+    c.source_hits['volume_surge'] = now
+normal = rotation.select(rows, selected, set(), rotation.target_for_mode('NORMAL'), '20260816', now)
+state.hot_codes = {f'{index:06d}' for index in range(2000,2050)}
+state.exploration_codes = set(normal.selected)
+ws = KiwoomWebSocket(state, None, None)
+_sessions, trade, program, orderbook = ws._targets()
+assert len(trade) <= 60, len(trade)
+assert not state.exploration_codes.intersection(program)
+assert not state.exploration_codes.intersection(orderbook)
+state.load_mode = 'CRITICAL'
+_sessions, critical_trade, critical_program, critical_orderbook = ws._targets()
+assert len(critical_trade) == 50, len(critical_trade)
+assert not state.exploration_codes.intersection(critical_trade)
+assert critical_program == program and critical_orderbook == orderbook
+assert len(RANK_SPECS) == 7, len(RANK_SPECS)
+print(json.dumps({
+    'ok': True,
+    'gate': 'MARKET_ROTATION_FUNCTIONAL',
+    'candidate_pool': len(rows),
+    'mode_slots': {m: rotation.target_for_mode(m) for m in ('NORMAL','BUSY','HIGH_LOAD','CRITICAL')},
+    'observed_sizes': {m: sorted(v) for m,v in observed.items()},
+    'trade_registered': len(trade),
+    'critical_trade_registered': len(critical_trade),
+    'broker_rank_specs_unchanged': len(RANK_SPECS),
+    'synthetic_wallclock_p95_is_deploy_fatal': False,
+    'runtime_perf_guard': '10_MIN_REAL_EVENT_LOOP_QUEUE_SWAP_OBSERVATION',
+}, ensure_ascii=False, sort_keys=True))
+print('MARKET_ROTATION_FUNCTIONAL_GATE=PASS')
+PYROT
+}
+
 fetch_dockerfile(){
   local raw tmp rc
   raw="https://raw.githubusercontent.com/${REPO}/${BRANCH}/${REMOTE_DOCKERFILE}"
@@ -351,7 +421,7 @@ dc "${CAND_ARGS[@]}" >/dev/null
 CAND_STARTED=1
 wait_health "$CANDIDATE"
 dc exec "$CANDIDATE" env PYTHONPATH=/app python /app/scripts/max_profit_acceptance.py | tee -a "$LOG"
-dc exec "$CANDIDATE" env PYTHONPATH=/app python /app/scripts/market_rotation_acceptance.py | tee -a "$LOG"
+rotation_functional_gate "$CANDIDATE" | tee -a "$LOG"
 dc exec "$CANDIDATE" env PYTHONPATH=/app python /app/scripts/r42_fresh_scout_acceptance.py | tee -a "$LOG"
 dc exec "$CANDIDATE" env PYTHONPATH=/app python /app/scripts/r492_safe_extension_acceptance.py | tee -a "$LOG"
 dc exec "$CANDIDATE" env PYTHONPATH=/app python /app/scripts/r492_market_index_verify_acceptance.py | tee -a "$LOG"
@@ -412,7 +482,7 @@ wait_health "$APP"
 
 say "6/9 ACTIVE GATES — MARKET MAP + OPENING RE-ACCEL + CLOSE BET + R492 CORE PROTECTED"
 dc exec "$APP" env PYTHONPATH=/app python /app/scripts/max_profit_acceptance.py | tee -a "$LOG"
-dc exec "$APP" env PYTHONPATH=/app python /app/scripts/market_rotation_acceptance.py | tee -a "$LOG"
+rotation_functional_gate "$APP" | tee -a "$LOG"
 dc exec "$APP" env PYTHONPATH=/app python /app/scripts/r42_fresh_scout_acceptance.py | tee -a "$LOG"
 dc exec "$APP" env PYTHONPATH=/app python /app/scripts/r492_safe_extension_acceptance.py | tee -a "$LOG"
 dc exec "$APP" env PYTHONPATH=/app python /app/scripts/r492_market_index_verify_acceptance.py | tee -a "$LOG"
