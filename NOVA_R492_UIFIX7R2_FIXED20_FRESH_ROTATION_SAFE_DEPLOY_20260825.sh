@@ -107,7 +107,7 @@ with tempfile.TemporaryDirectory(prefix='nova-lmpre-preflight-') as td:
             assert not n.startswith('/') and '..' not in n.split('/') and not (m.isdev() or m.issym() or m.islnk()),m.name
             assert logical not in names,logical;names.add(logical)
         tf.extractall(root)
-    required={'R492_FRESH_ROTATION_INVARIANTS.md','app/addons/large_mid_pre.py','static/large-mid-pre.js','tests/test_r492_large_mid_pre_fixed.py','scripts/r492_large_mid_pre_fixed_acceptance.py','R492_LARGE_MID_PRE_FIXED_INVARIANTS.md','SOURCE_MANIFEST.sha256'}
+    required={'R492_FRESH_ROTATION_INVARIANTS.md','app/broker/discovery.py','app/addons/large_mid_pre.py','static/large-mid-pre.js','tests/test_r492_large_mid_pre_fixed.py','scripts/r492_large_mid_pre_fixed_acceptance.py','R492_LARGE_MID_PRE_FIXED_INVARIANTS.md','SOURCE_MANIFEST.sha256'}
     assert required<=names,sorted(required-names)
     cp=subprocess.run(['sha256sum','-c','SOURCE_MANIFEST.sha256'],cwd=root,stdout=subprocess.DEVNULL,stderr=subprocess.STDOUT);assert cp.returncode==0,'manifest mismatch'
     protected={
@@ -126,7 +126,7 @@ with tempfile.TemporaryDirectory(prefix='nova-lmpre-preflight-') as td:
     assert "fill('preignition_accel',j.preignition,preRow,true,!j.market_active,20)" in panels
     for bad in ('insertAdjacentElement','insertAdjacentHTML','.innerHTML'):assert bad not in js,bad
     subprocess.run([sys.executable,'-m','py_compile',str(root/'app/addons/large_mid_pre.py'),str(root/'scripts/r492_large_mid_pre_fixed_acceptance.py')],check=True)
-disc=(root/'app/broker/discovery.py').read_text(); assert 'FRESH ROTATION:' in disc and 'soft_history' in disc and 'large_mid_pre_scout_until' in disc
+    disc=(root/'app/broker/discovery.py').read_text(); assert 'FRESH ROTATION:' in disc and 'soft_history' in disc and 'large_mid_pre_scout_until' in disc
 print(f'PREFLIGHT=PASS chunks={len(parts)} gzip_bytes={len(raw)} source_sha={actual} fixed_pre20=1 fixed_lmpre20=1 fresh_rotation=1 new_ws=0 rest_max=2')
 PY
 }
