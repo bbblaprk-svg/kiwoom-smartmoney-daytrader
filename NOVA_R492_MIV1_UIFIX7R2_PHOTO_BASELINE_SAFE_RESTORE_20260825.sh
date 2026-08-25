@@ -52,7 +52,7 @@ wait_health(){
 
 restore_previous(){
   local cur
-  trap - ERR INT TERM EXIT
+  trap - ERR INT TERM
   if [ "$NEW_STARTED" -eq 1 ] && dc inspect "$APP" >/dev/null 2>&1; then
     dc logs --tail 200 "$APP" >>"$LOG" 2>&1 || true
     dc stop -t 5 "$APP" >/dev/null 2>&1 || true
@@ -72,12 +72,12 @@ restore_previous(){
 on_error(){
   local rc=$?
   if [ "$STATE_MUTATED" -eq 1 ]; then restore_previous; fi
-  trap - ERR INT TERM EXIT
+  trap - ERR INT TERM
   echo "RESULT=ABORTED_NO_CHANGE CURRENT=$APP LOG=$LOG" | tee -a "$LOG"
   cleanup
   exit "$rc"
 }
-trap on_error ERR INT TERM EXIT
+trap on_error ERR INT TERM
 
 say "1/7 FETCH PHOTO BASELINE DOCKERFILE + SHA LOCK"
 raw="https://raw.githubusercontent.com/${REPO}/${BRANCH}/${REMOTE_DOCKERFILE}?ts=$(date +%s)"
@@ -96,7 +96,7 @@ echo "current_version=${CURRENT_VERSION:-UNKNOWN} current_uifix7=${CURRENT_UIFIX
 if [ "$CURRENT_VERSION" = "$EXPECTED_VERSION" ] && [ "$CURRENT_UIFIX7" = "$EXPECTED_UIFIX7" ]; then
   wait_health "$APP"
   echo "RESULT=ALREADY_PHOTO_BASELINE VERSION=$CURRENT_VERSION UIFIX7=$CURRENT_UIFIX7 CURRENT=$APP LOG=$LOG"
-  trap - ERR INT TERM EXIT
+  trap - ERR INT TERM
   cleanup
   exit 0
 fi
@@ -172,9 +172,28 @@ wait_health "$APP"
 [ "$(image_label "$APP" io.quantnova.r492_uifix7)" = "$EXPECTED_UIFIX7" ]
 
 say "6/7 RUNTIME SMOKE"
-dc exec "$APP" env PYTHONPATH=/app python /app/scripts/runtime_smoke.py --clients 2 --ready-timeout 30 | tee -a "$LOG"
+dc exec "$APP" python - <<'PY' | tee -a "$LOG"
+import json, os, urllib.request
+t=(os.getenv("NOVA_UI_ACCESS_TOKEN") or os.getenv("APP_ACCESS_TOKEN") or "").strip()
+h={"X-App-Token":t,"Authorization":"Bearer "+t} if t else {}
+def get(path):
+    with urllib.request.urlopen(urllib.request.Request("http://127.0.0.1:8000"+path,headers=h),timeout=8) as r:
+        return json.load(r)
+live=get("/api/livez")
+health=get("/api/realtime-health")
+assert live.get("ok") is True, live
+assert live.get("version")=="NOVA-3.3.5-R492-MARKET-INDEX-VERIFY1", live
+m=health.get("memory") or {}
+swap=float(m.get("swap_mb") or 0)
+lag=float(health.get("event_loop_lag_p95_ms") or 0)
+qage=float(health.get("trade_queue_oldest_age_ms") or 0)
+assert swap <= 8.0, m
+assert lag <= 250.0, health
+assert qage <= 750.0, health
+print(json.dumps({"runtime_smoke":"PASS","swap_mb":swap,"lag_p95_ms":lag,"queue_age_ms":qage},ensure_ascii=False))
+PY
 
 say "7/7 SUCCESS"
-trap - ERR INT TERM EXIT
+trap - ERR INT TERM
 cleanup
 echo "RESULT=SUCCESS PHOTO_BASELINE=UIFIX7R2 VERSION=$EXPECTED_VERSION UIFIX7=$EXPECTED_UIFIX7 CURRENT=$APP ROLLBACK_CONTAINER=$BACKUP LOG=$LOG"
