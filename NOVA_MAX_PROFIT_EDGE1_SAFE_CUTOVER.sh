@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -Eeuo pipefail
+set -euo pipefail
 umask 077
 
 APP="${NOVA_APP_CONTAINER:-quant-nova}"
@@ -34,6 +34,7 @@ LOG="/tmp/nova-max-profit-edge1-${STAMP}.log"
 OLD_EXISTS=0
 OLD_RENAMED=0
 NEW_STARTED=0
+ROLLBACK_DONE=0
 
 if docker info >/dev/null 2>&1; then DOCKER=(docker)
 elif sudo -n docker info >/dev/null 2>&1; then DOCKER=(sudo docker)
@@ -106,6 +107,8 @@ PY
 rollback(){
   local rc=$?
   trap - ERR INT TERM
+  if [[ "$ROLLBACK_DONE" -eq 1 ]]; then exit "${rc:-1}"; fi
+  ROLLBACK_DONE=1
   say "AUTO ROLLBACK"
   if [[ "$NEW_STARTED" -eq 1 ]] && dc inspect "$APP" >/dev/null 2>&1; then
     dc logs --tail 300 "$APP" >>"$LOG" 2>&1 || true
@@ -129,7 +132,7 @@ DOCKERFILE="$(cd "$(dirname "$DOCKERFILE")" && pwd)/$(basename "$DOCKERFILE")"
 protected_snapshot >"$WORK/protected.before"
 
 say "1. BUILD AND VERIFY IMAGE"
-dc build --pull -f "$DOCKERFILE" -t "$IMAGE" "$(dirname "$DOCKERFILE")" | tee -a "$LOG"
+dc build --pull -f "$DOCKERFILE" -t "$IMAGE" "$(dirname "$DOCKERFILE")" 2>&1 | tee -a "$LOG"
 LABEL_VERSION="$(dc image inspect "$IMAGE" --format '{{index .Config.Labels "org.opencontainers.image.version"}}')"
 [[ "$LABEL_VERSION" == "$EXPECTED_VERSION" ]]
 
