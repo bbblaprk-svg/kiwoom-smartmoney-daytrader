@@ -2,7 +2,7 @@ FROM python:3.12-slim
 LABEL io.pulse-edge.project="PULSE_EDGE" io.pulse-edge.runtime="3.9.1_HIDDEN_GEM_PUBLIC_READER"
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
 WORKDIR /app
-COPY PULSE_EDGE_GREENFIELD_3.9.1_HIDDEN_GEM_PUBLIC_READER_SOURCE.tar.gz /tmp/source.tar.gz
+COPY PULSE_EDGE_GREENFIELD_3_9_1_HIDDEN_GEM_PUBLIC_READER_SOURCE.tar.gz /tmp/source.tar.gz
 RUN python -c "import pathlib,tarfile; p=pathlib.Path('/tmp/source.tar.gz'); t=tarfile.open(p,'r:gz'); ms=t.getmembers(); names=set(); [( (_ for _ in ()).throw(AssertionError(m.name)) if (pathlib.PurePosixPath(m.name).is_absolute() or '..' in pathlib.PurePosixPath(m.name).parts or not (m.isfile() or m.isdir()) or m.name in names) else names.add(m.name) ) for m in ms]; t.extractall('/app',filter='data'); t.close(); req=['requirements-runtime.txt','pulse_edge/main.py','pulse_edge/config.py','pulse_edge/engine/features.py','pulse_edge/engine/scorer.py','pulse_edge/runtime.py','pulse_edge/storage/signals.py','deploy/offline_tests.py','deploy/verify.py']; missing=[f for f in req if not pathlib.Path('/app',f).is_file()]; assert not missing, missing" \
  && test -s /app/requirements-runtime.txt \
  && python -m pip install --no-cache-dir -r /app/requirements-runtime.txt \
